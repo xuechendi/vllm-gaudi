@@ -20,6 +20,10 @@ logger = init_logger()
 class HPUAttentionBackendV1(HPUAttentionBackend):
 
     @staticmethod
+    def get_builder_cls() -> type["HPUAttentionMetadataV1Builder"]:
+        return HPUAttentionMetadataV1Builder
+    
+    @staticmethod
     def get_name() -> str:
         return "HPU_ATTN_V1"
 
@@ -83,3 +87,82 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
             slot_mapping=slot_mapping,
             enable_kv_scales_calculation=False,
             block_size=block_size)
+
+@dataclass
+class HPUCommonAttentionMetadata:
+    """
+    Per-batch attention metadata, shared across layers and backends.
+    AttentionMetadataBuilder instances use it to construct per-layer metadata.
+    
+    For many of the tensors we keep both GPU and CPU versions.
+    """
+    # copied from CommonAttentionMetadata property as none
+
+    query_start_loc: torch.Tensor
+    slot_mapping: torch.Tensor
+    query_start_loc_cpu: Optional[torch.Tensor] = None
+    """(batch_size + 1,), the start location of each request in query Tensor"""
+
+    seq_lens: Optional[torch.Tensor] = None
+    seq_lens_cpu: Optional[torch.Tensor] = None
+    """(batch_size,), the length of each request including both computed tokens
+    and newly scheduled tokens"""
+
+    num_computed_tokens_cpu: Optional[torch.Tensor] = None
+    """(batch_size,), the number of computed tokens for each request"""
+
+    num_reqs: Optional[int] = None
+    """Number of requests"""
+    num_actual_tokens: Optional[int] = None
+    """Total number of tokens in batch"""
+    max_query_len: Optional[int] = None
+    """Longest query in batch"""
+    max_seq_len: Optional[int] = None
+    """Longest context length in batch"""
+
+    block_table_tensor: Optional[torch.Tensor] = None
+
+    causal: bool = True
+ 
+    hpu_attn_metadata: Optional[HPUAttentionMetadataV1] = None
+
+
+class HPUAttentionMetadataV1Builder:
+
+    def __init__(self, layer_names: list[str]):
+        pass
+
+    def build(self,
+              common_attn_metadata: HPUCommonAttentionMetadata) -> HPUAttentionMetadataV1:
+        attn_metadata = common_attn_metadata.hpu_attn_metadata
+        return HPUCommonAttentionMetadata(
+            query_start_loc=common_attn_metadata.query_start_loc,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            hpu_attn_metadata=HPUAttentionMetadataV1.make_decode_metadata(
+                block_list=attn_metadata.block_list,
+                block_usage=attn_metadata.block_usage,
+                block_groups=attn_metadata.block_groups,
+                input_positions=None,
+                num_decode_tokens=attn_metadata.num_decode_tokens,
+                slot_mapping=attn_metadata.slot_mapping,
+                block_size=attn_metadata.block_size,
+            )
+        )
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: HPUCommonAttentionMetadata,
+        draft_index: int,
+    ):
+        """
+        Build attention metadata for draft model. Uses build by default.
+        
+        Args:
+            common_attn_metadata: The common attention metadata.
+            draft_index: The index of the current draft operation.
+                When speculating a chain of tokens, this index refers to the
+                draft attempt for the i-th token.
+                For tree-based attention, this index instead refers to the
+                draft attempt for the i-th level in the tree of tokens.
+        """
+        return self.build(common_attn_metadata=common_attn_metadata)
