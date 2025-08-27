@@ -8,7 +8,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeAlias, Union, Literal
 
 import habana_frameworks.torch as htorch
 import habana_frameworks.torch.internal.bridge_config as bc
@@ -56,7 +56,7 @@ from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput)
+                             ModelRunnerOutput,KVConnectorOutput)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
@@ -70,6 +70,7 @@ from vllm.v1.worker.utils import (gather_mm_placeholders,
                                   sanity_check_mm_encoder_outputs,
                                   scatter_mm_placeholders)
 from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.core.sched.output import NewRequestData
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -1130,11 +1131,15 @@ class HPUModelRunner:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        requests_type = {}
         if scheduler_output.kv_connector_metadata:
-            requests = scheduler_output.kv_connector_metadata.requests
+            for req in scheduler_output.kv_connector_metadata.reqs_to_save:
+                requests_type[req] = 'prefill'
+            for req in scheduler_output.kv_connector_metadata.reqs_to_recv:
+                requests_type[req] = 'decode'
+            requests = scheduler_output.kv_connector_metadata.reqs_to_save | scheduler_output.kv_connector_metadata.reqs_to_recv
         else:
             requests = None
-
         # Traverse decodes first
         decode_req_ids = []
         num_computed_tokens_decode = []
@@ -1751,13 +1756,10 @@ class HPUModelRunner:
         seen = cfg in self.seen_configs
         self.seen_configs.add(cfg)
         if not seen and not warmup_mode:
-<<<<<<< HEAD
             logger.warning("Configuration: %s was not warmed-up!", cfg)
-=======
             logger.warning(
                 "Configuration: rank (%s, %s, %s, %s, %s) was not warmed-up!",
                 os.getenv('RANK', '0'), phase, batch_size, seq_len, num_blocks)
->>>>>>> 419d981 (Enable LMCache for cpuoffloading, LMCache docker support, enable lmcache)
 
     def _execute_model_generic(self,
                                token_ids,
@@ -2128,22 +2130,9 @@ class HPUModelRunner:
                         model_mm_kwargs=model_mm_kwargs,
                         warmup_mode=warmup_mode)
                 htorch.core.mark_step()
-<<<<<<< HEAD
                 # Skip separate sampling for structured output
                 if structured_output:
                     logits_prompt.append(logits_device)
-=======
-                finished_sending, finished_recving = (
-                    self.get_finished_kv_transfers(scheduler_output))
-                with self.profiler.record_event('internal', "sampler"):
-                    sampling_metadata = self._prepare_sampling(
-                        batch_changed, req_id, pad_to=logits_device.shape[0])
-                    sampler_output = self.sampler(
-                        logits=logits_device,
-                        sampling_metadata=sampling_metadata)
-                    prefill_sampled_token_ids.append(
-                        sampler_output.sampled_token_ids.flatten())
->>>>>>> 419d981 (Enable LMCache for cpuoffloading, LMCache docker support, enable lmcache)
                     prefill_sampled_requests.extend(logits_requests)
                 else:
                     with self.profiler.record_event('internal', "sampler"):
@@ -2171,6 +2160,9 @@ class HPUModelRunner:
                         prompt_batch_idx=idx,
                         is_prompt=True)
                     self.profiler.record_counter(self.event_start, counters)
+            self.maybe_wait_for_kv_save(scheduler_output.scheduled_new_reqs)
+            finished_sending, finished_recving = (
+                self.get_finished_kv_transfers(scheduler_output))
             if self.is_driver_worker and self.profiler.enabled:
                 self.profiler_counter_helper.reset_prompt_seq_stats()
 
@@ -2181,7 +2173,6 @@ class HPUModelRunner:
             self.profiler.start("internal", "decode")
             assert decode_data is not None
             htorch.core.mark_step()
-<<<<<<< HEAD
             _, logits_device = self._execute_model_generic(
                 decode_data.token_ids,
                 decode_data.position_ids,
@@ -2193,26 +2184,6 @@ class HPUModelRunner:
 
             if structured_output:
                 logits_decode.append(logits_device[:num_decodes])
-=======
-            self.maybe_setup_kv_connector(scheduler_output)
-            _, logits_device = \
-                self._execute_model_generic(
-                decode_data.token_ids, decode_data.position_ids,
-                decode_data.attn_metadata, decode_data.logits_indices,
-                self.kv_caches)
-            htorch.core.mark_step()
-            finished_sending, finished_recving = (
-                self.get_finished_kv_transfers(scheduler_output))
-            with self.profiler.record_event('internal', "sampler"):
-                sampling_metadata = self._prepare_sampling(
-                    batch_changed,
-                    pd_info.decode_req_ids,
-                    pad_to=logits_device.shape[0])
-                sampler_output = self.sampler(
-                    logits=logits_device, sampling_metadata=sampling_metadata)
-                decode_sampled_token_ids.append(
-                    sampler_output.sampled_token_ids.flatten())
->>>>>>> 419d981 (Enable LMCache for cpuoffloading, LMCache docker support, enable lmcache)
                 decode_sampled_requests.extend(
                     self.input_batch.req_ids[:num_decodes])
             else:
@@ -2351,6 +2322,10 @@ class HPUModelRunner:
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                                    finished_sending=finished_sending,
+                                    finished_recving=finished_recving,
+            ),
             #finished_sending=finished_sending,
             #finished_recving=finished_recving,
         )
@@ -2846,7 +2821,7 @@ class HPUModelRunner:
                     else:
                         value_cache = None
                     for layer_name in kv_cache_tensor.shared_by:
-                        kv_caches[layer_name] = (key_cache, value_cache)
+                        kv_caches[layer_name] = torch.stack((key_cache, value_cache), dim=0)
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
@@ -2865,6 +2840,11 @@ class HPUModelRunner:
             self.bucketing_manager.num_hpu_blocks = num_blocks
         self._PAD_BLOCK_ID = num_blocks
         self._PAD_SLOT_ID = num_blocks * self.block_size
+        
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_kv_caches(kv_caches)
+            if self.vllm_config.kv_transfer_config.kv_buffer_device == 'cpu':
+                get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
 
         htorch.hpu.synchronize()
 
@@ -2949,6 +2929,11 @@ class HPUModelRunner:
                 scheduler_output.kv_connector_metadata)
 
     @staticmethod
+    def maybe_wait_for_kv_save(req: Optional[NewRequestData]) -> None:
+        if has_kv_transfer_group():
+            get_kv_transfer_group().wait_for_save()
+
+    @staticmethod
     def get_finished_kv_transfers(
         scheduler_output: "SchedulerOutput",
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
@@ -2975,3 +2960,59 @@ class HPUModelRunner:
         output.finished_sending = finished_sending
         output.finished_recving = finished_recving
         return output
+
+def _make_src_and_dst_indices(
+    block_size: int,
+    src_block_ids: list[int],
+    dst_block_ids: list[int],
+    src_device: Union[torch.device, str],
+    dst_device: Union[torch.device, str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    src_indices = torch.tensor(src_block_ids,
+                               device=src_device,
+                               dtype=torch.int64)
+    dst_indices = torch.tensor(dst_block_ids,
+                               device=dst_device,
+                               dtype=torch.int64)
+    #convert to slot mapping
+    src_slot_mapping = torch.concat([torch.arange(start=s*block_size, end=(s+1)*block_size) for s in src_indices])
+    dst_slot_mapping = torch.concat([torch.arange(start=d*block_size, end=(d+1)*block_size) for d in dst_indices])
+    return src_slot_mapping, dst_slot_mapping
+
+def copy_kv_blocks(
+    block_size: int,
+    src_kv_caches: dict[str, torch.Tensor],
+    dst_kv_caches: dict[str, torch.Tensor],
+    src_block_ids: list[int],
+    dst_block_ids: list[int],
+    direction: Literal["h2d", "d2h"],
+) -> None:
+    """Copy kv blocks between different buffers."""
+    if not src_kv_caches or not dst_kv_caches or \
+       not src_block_ids or not dst_block_ids or \
+       len(src_block_ids) != len(dst_block_ids):
+        return
+    assert len(src_block_ids) == len(dst_block_ids)
+    src_device = next(iter(src_kv_caches.values()))[0].device
+    dst_device = next(iter(dst_kv_caches.values()))[0].device
+
+    src_slot_mapping, dst_slot_mapping = _make_src_and_dst_indices(
+        block_size=block_size,
+        src_block_ids=src_block_ids,
+        dst_block_ids=dst_block_ids,
+        src_device=src_device,
+        dst_device=dst_device)
+
+    start = time.perf_counter()
+    if direction == "h2d":
+        device = 'hpu'
+    else:
+        device = 'cpu'
+    for layer_name in src_kv_caches:
+        key_cache = src_kv_caches[layer_name][0]
+        value_cache = src_kv_caches[layer_name][1]
+        dst_kv_caches[layer_name][0][dst_slot_mapping] = key_cache[src_slot_mapping].to(device)
+        dst_kv_caches[layer_name][1][dst_slot_mapping] = value_cache[src_slot_mapping].to(device)
+    torch.hpu.synchronize()
+
+    logger.info(f"copy_kv_blocks: copy takes {time.perf_counter() - start}|{direction=}|{os.getpid()=}|{block_size=}|{len(src_block_ids)=}|{len(dst_block_ids)=}")
