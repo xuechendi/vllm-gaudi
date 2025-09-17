@@ -131,6 +131,12 @@ class HpuPlatform(Platform):
     def supports_v1(cls, model_config: ModelConfig) -> bool:
         # V1 support on HPU is experimental
         return True
+    
+    @classmethod
+    def get_nixl_supported_xpus(cls) -> dict[str, tuple[str, ...]]:
+        if os.environ.get("VLLM_NIXL_BACKEND", "UCX").lower() == "ofi":
+            return {"hpu": ("hpu", )}
+        return {"hpu": ("cpu", )}
 
     @classmethod
     def set_torch_compile(cls) -> None:

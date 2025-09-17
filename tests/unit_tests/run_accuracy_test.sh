@@ -1,5 +1,5 @@
 #!/bin/bash
-set -xe
+#set -xe
 
 # Models to run
 MODELS=(
@@ -22,6 +22,7 @@ DECODER_TP_SIZE=${DECODER_TP_SIZE:-1}
 # Find the git repository root directory
 #GIT_ROOT=$(git rev-parse --show-toplevel)
 GIT_ROOT="/home/vllm-nixl/vllm"
+NIXL_BUFFER_DEVICE=${NIXL_BUFFER_DEVICE:-"cpu"}
 
 #SMI_BIN=$(which nvidia-smi || which rocm-smi)
 
@@ -100,7 +101,7 @@ run_tests_for_model() {
     --max_num_batched_tokens 8192 \
     --gpu-memory-utilization 0.3 \
     --tensor-parallel-size $PREFILLER_TP_SIZE \
-    --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
+    --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"${NIXL_BUFFER_DEVICE}\"}'"
 
     if [ -n "$model_args" ]; then
     FULL_CMD="$BASE_CMD $model_args"
@@ -133,7 +134,7 @@ run_tests_for_model() {
     --max_num_batched_tokens 8192 \
     --gpu-memory-utilization 0.3 \
     --tensor-parallel-size $DECODER_TP_SIZE \
-    --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
+    --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"${NIXL_BUFFER_DEVICE}\"}'"
 
     if [ -n "$model_args" ]; then
     FULL_CMD="$BASE_CMD $model_args"

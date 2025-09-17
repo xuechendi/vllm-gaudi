@@ -6,10 +6,13 @@ import torch
 from vllm_gaudi.extension.logger import logger as init_logger
 from vllm.distributed.kv_transfer.kv_connector.v1 import (nixl_connector)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (NixlAgentMetadata, NixlConnectorWorker)
+from vllm_gaudi.platform import HpuPlatform, logger
+import habana_frameworks.torch.utils.experimental as htexp
 
 logger = init_logger()
 
-nixl_connector._NIXL_SUPPORTED_XPUS = {"cuda": ("cuda", ), "tpu": ("cpu", ), "hpu": ("cpu", )}
+nixl_connector._NIXL_SUPPORTED_XPUS.update(HpuPlatform.get_nixl_supported_xpus())
+print("_NIXL_SUPPORTED_XPUS:", nixl_connector._NIXL_SUPPORTED_XPUS)
 
 
 def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -99,7 +102,10 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
                         or self._use_pallas_v1 or self._use_flashinfer \
                         else cache_or_caches
         for cache in cache_list:
-            base_addr = cache.data_ptr()
+            if self.use_host_buffer:
+                base_addr = cache.data_ptr()
+            else:
+                base_addr = htexp._data_ptr(cache)
             region_len = self.num_blocks * self.block_len
             # NOTE: use tp_rank for device_id since multi-node TP
             # is rarely used.
@@ -129,7 +135,7 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
 
     descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
     logger.debug("Registering descs: %s", caches_data)
-    self.nixl_wrapper.register_memory(descs)
+    self.nixl_wrapper.register_memory(descs, backends=[self.nixl_backend])
     logger.debug("Done registering descs")
     self._registered_descs.append(descs)
 

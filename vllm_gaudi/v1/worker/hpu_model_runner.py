@@ -523,6 +523,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         self.is_driver_worker = is_driver_worker
         self.use_aux_hidden_state_outputs = False
         self.supports_mm_inputs = False
+        self.kv_transfer_start = 0
 
         self.sampler = get_sampler()
 
@@ -963,6 +964,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
             req_ids_to_add.append(req_id)
         # Update the states of the running/resumed requests.
+        
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(req_data.req_ids):
@@ -2502,6 +2504,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 # Return empty ModelRunnerOuptut if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # For D case, wait until kv finish load here
+            self.kv_transfer_start = time.time_ns() // 1000
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
         if self.input_batch.pooling_params:
             (input_ids, position_ids, num_scheduled_tokens, attn_metadata,
@@ -2631,6 +2634,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                     self.profiler.record_counter(self.event_start, counters)
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (self.get_finished_kv_transfers(scheduler_output))
+            if finished_recving is not None:
+                elapse = time.time_ns() // 1000 - self.kv_transfer_start
+                logger.info(f"KV transfer finished {finished_recving} requests, elapse {elapse // 1000} ms")
+            # Join prefill results
 
             if self.is_driver_worker and self.profiler.enabled:
                 self.profiler_counter_helper.reset_prompt_seq_stats()
@@ -3098,6 +3105,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         num_candidates = len(buckets)
         captured_all = True
         for idx, (batch_size, seq_len, num_blocks) in enumerate(reversed(buckets)):
+            if seq_len > self.max_num_tokens:
+                captured_all = False
+                continue
             # Graph memory usage is proportional to seq dimension in a batch
             phase = f"Graph/{'prompt' if is_prompt else 'decode'}"
             if is_prompt:
@@ -3508,7 +3518,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
-            get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
+            if self.vllm_config.kv_transfer_config.kv_buffer_device == "cpu":
+                get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
             global hpu_buffer
         htorch.hpu.synchronize()
 
@@ -3813,7 +3824,7 @@ def copy_kv_blocks(
 
     torch.hpu.synchronize()
 
-    logger.info("copy_kv_blocks: copy takes %s"
+    logger.debug("copy_kv_blocks: copy takes %s"
                 "|direction=%s|pid=%s|block_size=%s"
                 "|src_blocks=%s|dst_blocks=%s",
                 time.perf_counter() - start, direction, os.getpid(), block_size, len(src_block_ids), len(dst_block_ids))
