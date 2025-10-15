@@ -528,7 +528,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
         key_cache = None
         value_cache = None
-        if kv_cache is not None and isinstance(kv_cache, tuple):
+        if kv_cache is not None:
             key_cache, value_cache = HPUPagedAttention.split_kv_cache(kv_cache, self.num_kv_heads, self.head_size)
 
             # Reshape the input keys and values and store them in the cache.
@@ -681,7 +681,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
 
         cross_slot_mapping = attn_metadata.cross_slot_mapping.flatten(
         ) if attn_metadata.cross_slot_mapping is not None else None
-        if kv_cache is not None and isinstance(kv_cache, tuple):
+        if kv_cache is not None:
             key_cache, value_cache = HPUPagedAttention.split_kv_cache(kv_cache, self.num_kv_heads, self.head_size)
 
             # Reshape the input keys and values and store them in the cache.

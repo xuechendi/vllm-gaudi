@@ -79,6 +79,7 @@ from vllm.model_executor.models import supports_lora, supports_multimodal
 from vllm_gaudi.extension.ops import LoraMask as LoraMask
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.platforms import current_platform
+from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -4183,16 +4184,12 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
                                                                           kv_cache_spec.num_kv_heads,
                                                                           kv_cache_spec.head_size)
-                    v_cache_shape = None if self.model_config.use_mla \
-                        else kv_cache_shape
+                    spkit_kv = not self.model_config.use_mla
                     dtype = kv_cache_spec.dtype
-                    key_cache = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
-                    if v_cache_shape is not None:
-                        value_cache = torch.zeros(v_cache_shape, dtype=dtype, device=self.device)
-                    else:
-                        value_cache = None
+                    kv_shape_new = (2, *kv_cache_shape) if spkit_kv else kv_cache_shape
+                    kv_caches_per_layer = torch.zeros(kv_shape_new, dtype=dtype, device=self.device)
                     for layer_name in kv_cache_tensor.shared_by:
-                        kv_caches[layer_name] = (key_cache, value_cache)
+                        kv_caches[layer_name] = kv_caches_per_layer
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
@@ -4217,19 +4214,17 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
     def get_kv_caches_4D(self, kv_caches) -> dict[str, torch.Tensor]:
         kv_caches_4D: dict[str, torch.Tensor] = {}
-        for layer_name, cache_or_cachelist in kv_caches.items():
-            split_kv = isinstance(cache_or_cachelist, tuple)
-            caches = [cache_or_cachelist] if not split_kv else cache_or_cachelist
-            kv_per_layer = [] if split_kv else None
-            for cache in caches:
-                cache_in_4d = cache.view(-1, self.block_size, *cache.shape[1:])
-                if split_kv:
-                    kv_per_layer.append(cache_in_4d)
-                else:
-                    kv_per_layer = cache_in_4d
-                #NOTE(Chendi): Do not remove, call torch data_ptr to record physical address
-                cache.data_ptr()
-            kv_caches_4D[layer_name] = kv_per_layer
+        split_kv = not self.model_config.use_mla
+        for layer_name, cache in kv_caches.items():
+            kv_cache_per_layer = cache.view(2, -1, self.block_size, *cache.shape[2:]) \
+                if split_kv else cache.view(-1, self.block_size, *cache.shape[1:])
+            cache_list = cache if split_kv else [cache]
+            # NOTE(Chendi): Do not remove both data_ptr() call, 
+            # they are used to record physical address
+            base_addr = cache.data_ptr(virtual=True)
+            for i in range(len(cache_list)):
+                cache_list[i].data_ptr(base_addr=base_addr)
+            kv_caches_4D[layer_name] = kv_cache_per_layer
         return kv_caches_4D
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -4463,84 +4458,3 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             if len(draft_token_ids[i]) == 0:
                 draft_token_ids[i] = [-1]
         return draft_token_ids
-
-
-def _make_src_and_dst_indices(
-    block_size: int,
-    src_block_ids: list[int],
-    dst_block_ids: list[int],
-    src_device: Union[torch.device, str],
-    dst_device: Union[torch.device, str],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    #convert to slot mapping
-    src_slot_mapping = np.concatenate(
-        [np.arange(start=s * block_size, stop=(s + 1) * block_size) for s in src_block_ids])
-    dst_slot_mapping = np.concatenate(
-        [np.arange(start=d * block_size, stop=(d + 1) * block_size) for d in dst_block_ids])
-
-    src_slot_mapping = torch.tensor(src_slot_mapping, device=src_device, dtype=torch.int64)
-    dst_slot_mapping = torch.tensor(dst_slot_mapping, device=dst_device, dtype=torch.int64)
-    return src_slot_mapping, dst_slot_mapping
-
-
-def copy_kv_blocks(
-    src_kv_caches: dict[str, torch.Tensor],
-    dst_kv_caches: dict[str, torch.Tensor],
-    src_block_ids: list[int],
-    dst_block_ids: list[int],
-    direction: Literal["h2d", "d2h"],
-    block_size: int = 128,
-) -> None:
-    """Copy kv blocks between different buffers."""
-    if not src_kv_caches or not dst_kv_caches or \
-       not src_block_ids or not dst_block_ids or \
-       len(src_block_ids) != len(dst_block_ids):
-        return
-    assert len(src_block_ids) == len(dst_block_ids)
-    src_device = next(iter(src_kv_caches.values()))[0].device
-    dst_device = next(iter(dst_kv_caches.values()))[0].device
-
-    src_slot_mapping, dst_slot_mapping = _make_src_and_dst_indices(block_size=block_size,
-                                                                   src_block_ids=src_block_ids,
-                                                                   dst_block_ids=dst_block_ids,
-                                                                   src_device=src_device,
-                                                                   dst_device=dst_device)
-
-    start = time.perf_counter()
-    target_device = dst_device.type
-
-    i = 0
-    global hpu_buffer
-    use_hpu_buffer = False
-    for layer_name in src_kv_caches:
-        key_cache = src_kv_caches[layer_name][0]
-        value_cache = src_kv_caches[layer_name][1]
-        if direction == "d2h":
-            # NOTE(chendi): in order to keep host_buffer shape[0] same as tpu and gpu case
-            # so we need to flatten the dst_kv_caches
-            dst_kv_caches[layer_name] = dst_kv_caches[layer_name].flatten(1, 2)
-        else:
-            key_cache = key_cache.flatten(0, 1)
-            if value_cache is not None:
-                value_cache = value_cache.flatten(0, 1)
-
-        if direction == "d2h" and use_hpu_buffer:
-            hpu_buffer[i][0] = key_cache.index_select(0, src_slot_mapping)
-            hpu_buffer[i][1] = value_cache.index_select(0, src_slot_mapping)
-        else:
-            dst_kv_caches[layer_name][0].index_put_((dst_slot_mapping, ),
-                                                    key_cache.index_select(0, src_slot_mapping).to(target_device))
-            dst_kv_caches[layer_name][1].index_put_((dst_slot_mapping, ),
-                                                    value_cache.index_select(0, src_slot_mapping).to(target_device))
-        if direction == "d2h":
-            dst_kv_caches[layer_name] = dst_kv_caches[layer_name].unflatten(1, (-1, block_size))
-
-        i = i + 1
-
-    torch.hpu.synchronize()
-
-    logger.debug("copy_kv_blocks: copy takes %s"
-                 "|direction=%s|pid=%s|block_size=%s"
-                 "|src_blocks=%s|dst_blocks=%s",
-                 time.perf_counter() - start, direction, os.getpid(), block_size, len(src_block_ids),
-                 len(dst_block_ids))

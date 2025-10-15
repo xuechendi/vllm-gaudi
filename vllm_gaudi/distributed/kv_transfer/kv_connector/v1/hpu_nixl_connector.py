@@ -16,8 +16,8 @@ def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> Non
         for layer_name, kv_cache in kv_caches.items():
             if self.device_type == "hpu":
                 kv_shape = kv_cache[0].shape
-                kv_shape_new = (2, kv_shape[0] // self.block_size, self.block_size, *kv_shape[1:])
                 kv_dtype = kv_cache[0].dtype
+                kv_shape_new = (2, *kv_shape)
                 xfer_buffers[layer_name] = torch.empty(kv_shape_new, dtype=kv_dtype, device="cpu")
             else:
                 kv_shape = kv_cache.shape
@@ -37,7 +37,7 @@ original_data_ptr = torch.Tensor.data_ptr
 global_data_ptr_record = {}
 
 
-def _hpu_data_ptr(tensor_self, unregister=False) -> int:
+def _hpu_data_ptr(tensor_self, virtual=False, base_addr=None) -> int:
     """
     A temporary replacement for tensor.data_ptr().
     
@@ -50,14 +50,15 @@ def _hpu_data_ptr(tensor_self, unregister=False) -> int:
     if tensor_self.device.type == 'hpu':
         #return htexp._data_ptr(tensor_self)
         v_dataptr = original_data_ptr(tensor_self)
-        if v_dataptr not in global_data_ptr_record:
+        p_dataptr = global_data_ptr_record.get(v_dataptr, None)
+        if base_addr is not None:
+            offset = v_dataptr - base_addr
+            p_dataptr_base = global_data_ptr_record.get(base_addr, None)
+            p_dataptr = p_dataptr_base + offset if p_dataptr_base is not None else None
+        if p_dataptr is None:
             p_dataptr = htexp._data_ptr(tensor_self)
-            global_data_ptr_record[v_dataptr] = p_dataptr
-        else:
-            p_dataptr = global_data_ptr_record[v_dataptr]
-        if unregister:
-            del global_data_ptr_record[v_dataptr]
-        return p_dataptr
+        global_data_ptr_record[v_dataptr] = p_dataptr
+        return p_dataptr if not virtual else v_dataptr
 
     # Fallback to the original implementation for CPU tensors or host buffers
     return original_data_ptr(tensor_self)
